@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=C:\Users\tyler\OneDrive\Documents\GitHub\JWKS_Project2\target\debug\build\mime_guess-2c30d9ba59473b2e\out\mime_types_generated.rs
