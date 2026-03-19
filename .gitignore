@@ -1,0 +1,10 @@
+# Rust build outputs
+/target/
+
+# Local SQLite runtime file
+/totally_not_my_privateKeys.db
+
+# Coverage artifacts
+/llvm-cov-target/
+/lcov.info
+/*.profraw

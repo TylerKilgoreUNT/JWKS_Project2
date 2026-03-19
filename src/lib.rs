@@ -9,8 +9,9 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use warp::{http::StatusCode, Filter, Rejection, Reply};
+use warp::{http::StatusCode, Filter, Rejection};
 
+/// SQLite filename required by the project rubric.
 pub const DB_FILE: &str = "totally_not_my_privateKeys.db";
 
 const TABLE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS keys(\
@@ -18,7 +19,11 @@ const TABLE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS keys(\
     key BLOB NOT NULL,\
     exp INTEGER NOT NULL\
 )";
+const KEY_LIFETIME_SECONDS: i64 = 3600;
+const JWT_SUBJECT: &str = "userABC";
+const JWT_NAME: &str = "userABC";
 
+/// Shared application state containing the SQLite file path.
 #[derive(Clone)]
 pub struct AppState {
     db_path: Arc<String>,
@@ -50,66 +55,89 @@ struct JwtClaims {
     exp: i64,
 }
 
+fn format_error(context: &str, err: impl std::fmt::Display) -> String {
+    format!("{context}: {err}")
+}
+
+fn open_connection(db_path: &str) -> Result<Connection, String> {
+    Connection::open(db_path).map_err(|err| format_error("failed to open SQLite database", err))
+}
+
+/// Creates/opens the SQLite database, ensures schema exists, and seeds keys.
 pub fn initialize_database(db_path: &str) -> Result<(), String> {
-    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    // Open/create the database, ensure schema exists, and seed required key rows.
+    let mut conn = open_connection(db_path)?;
 
     conn.execute(TABLE_SCHEMA, [])
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format_error("failed to create keys table", err))?;
 
-    ensure_seed_keys(&conn)?;
+    ensure_seed_keys(&mut conn)?;
     Ok(())
 }
 
-fn ensure_seed_keys(conn: &Connection) -> Result<(), String> {
+fn ensure_seed_keys(conn: &mut Connection) -> Result<(), String> {
     let now = Utc::now().timestamp();
+    let transaction = conn
+        .transaction()
+        .map_err(|err| format_error("failed to start seed transaction", err))?;
 
-    let expired_count: i64 = conn
+    // Seed one expired key if none currently exist.
+    let expired_count: i64 = transaction
         .query_row("SELECT COUNT(1) FROM keys WHERE exp <= ?1", [now], |row| {
             row.get(0)
         })
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format_error("failed to count expired keys", err))?;
 
     if expired_count == 0 {
         let expired_pem = generate_private_key_pem()?;
-        let expired_exp = now - 3600;
-        conn.execute(
-            "INSERT INTO keys (key, exp) VALUES (?1, ?2)",
-            params![expired_pem.into_bytes(), expired_exp],
-        )
-        .map_err(|err| err.to_string())?;
+        let expired_exp = now - KEY_LIFETIME_SECONDS;
+        transaction
+            .execute(
+                "INSERT INTO keys (key, exp) VALUES (?, ?)",
+                params![expired_pem.into_bytes(), expired_exp],
+            )
+            .map_err(|err| format_error("failed to insert expired key", err))?;
     }
 
-    let valid_count: i64 = conn
+    // Seed one valid key if none currently exist.
+    let valid_count: i64 = transaction
         .query_row("SELECT COUNT(1) FROM keys WHERE exp > ?1", [now], |row| {
             row.get(0)
         })
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format_error("failed to count valid keys", err))?;
 
     if valid_count == 0 {
         let valid_pem = generate_private_key_pem()?;
-        let valid_exp = now + 3600;
-        conn.execute(
-            "INSERT INTO keys (key, exp) VALUES (?1, ?2)",
-            params![valid_pem.into_bytes(), valid_exp],
-        )
-        .map_err(|err| err.to_string())?;
+        let valid_exp = now + KEY_LIFETIME_SECONDS;
+        transaction
+            .execute(
+                "INSERT INTO keys (key, exp) VALUES (?, ?)",
+                params![valid_pem.into_bytes(), valid_exp],
+            )
+            .map_err(|err| format_error("failed to insert valid key", err))?;
     }
+
+    transaction
+        .commit()
+        .map_err(|err| format_error("failed to commit seed transaction", err))?;
 
     Ok(())
 }
 
 fn generate_private_key_pem() -> Result<String, String> {
-    let private_key = RsaPrivateKey::new(&mut thread_rng(), 2048).map_err(|err| err.to_string())?;
+    let private_key = RsaPrivateKey::new(&mut thread_rng(), 2048)
+        .map_err(|err| format_error("failed to generate RSA private key", err))?;
     private_key
         .to_pkcs1_pem(LineEnding::LF)
         .map(|pem| pem.to_string())
-        .map_err(|err| err.to_string())
+        .map_err(|err| format_error("failed to encode private key as PKCS1 PEM", err))
 }
 
 fn load_signing_key(db_path: &str, use_expired: bool) -> Result<StoredKey, String> {
-    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let conn = open_connection(db_path)?;
     let now = Utc::now().timestamp();
 
+    // Select an expired or valid signing key based on the request mode.
     let query = if use_expired {
         "SELECT kid, key FROM keys WHERE exp <= ?1 ORDER BY exp DESC LIMIT 1"
     } else {
@@ -122,16 +150,17 @@ fn load_signing_key(db_path: &str, use_expired: bool) -> Result<StoredKey, Strin
             key_pem: row.get(1)?,
         })
     })
-    .map_err(|err| err.to_string())
+    .map_err(|err| format_error("failed to load signing key", err))
 }
 
 fn load_valid_private_keys(db_path: &str) -> Result<Vec<StoredKey>, String> {
-    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    // Return all currently valid keys for JWKS publication.
+    let conn = open_connection(db_path)?;
     let now = Utc::now().timestamp();
 
     let mut statement = conn
         .prepare("SELECT kid, key FROM keys WHERE exp > ?1 ORDER BY kid ASC")
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format_error("failed to prepare valid-key query", err))?;
 
     let rows = statement
         .query_map([now], |row| {
@@ -140,34 +169,61 @@ fn load_valid_private_keys(db_path: &str) -> Result<Vec<StoredKey>, String> {
                 key_pem: row.get(1)?,
             })
         })
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format_error("failed to execute valid-key query", err))?;
 
     let mut keys = Vec::new();
     for row in rows {
-        keys.push(row.map_err(|err| err.to_string())?);
+        keys.push(row.map_err(|err| format_error("failed to read key row", err))?);
     }
 
     Ok(keys)
+}
+
+fn should_use_expired_key(params: &HashMap<String, String>) -> bool {
+    match params.get("expired") {
+        Some(value) if value.is_empty() => true,
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        ),
+        None => false,
+    }
+}
+
+fn text_response(status: StatusCode, body: impl Into<String>) -> warp::reply::WithStatus<String> {
+    warp::reply::with_status(body.into(), status)
+}
+
+fn json_error_response(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> warp::reply::WithStatus<warp::reply::Json> {
+    let body = json!({ "error": message.into() });
+    warp::reply::with_status(warp::reply::json(&body), status)
 }
 
 fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = Infallible> + Clone {
     warp::any().map(move || state.clone())
 }
 
+/// Builds all HTTP routes for the Project 2 JWKS service.
 pub fn build_routes(
     state: AppState,
-) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
-    let method_not_allowed = warp::any()
-        .map(|| warp::reply::with_status("Method Not Allowed", StatusCode::METHOD_NOT_ALLOWED));
+) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    // Shared fallback for unsupported methods on known paths.
+    let method_not_allowed =
+        warp::any().map(|| text_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed"));
 
+    // POST /auth issues JWTs signed by a DB-backed private key.
     let auth = warp::path("auth").and(
         warp::post()
             .and(warp::query::<HashMap<String, String>>())
             .and(with_state(state.clone()))
             .map(auth_handler)
-            .or(method_not_allowed.clone()),
+            .or(method_not_allowed),
     );
 
+    // GET /.well-known/jwks.json publishes public keys for valid private keys.
     let jwks = warp::path!(".well-known" / "jwks.json").and(
         warp::get()
             .and(with_state(state))
@@ -178,86 +234,101 @@ pub fn build_routes(
     auth.or(jwks)
 }
 
-fn auth_handler(params: HashMap<String, String>, state: AppState) -> impl Reply {
-    let use_expired_key = params.contains_key("expired");
+fn auth_handler(
+    params: HashMap<String, String>,
+    state: AppState,
+) -> warp::reply::WithStatus<String> {
+    // Resolve whether this request should use an expired or valid signing key.
+    let use_expired_key = should_use_expired_key(&params);
     let now = Utc::now().timestamp();
 
     let signing_key = match load_signing_key(state.db_path(), use_expired_key) {
         Ok(key) => key,
-        Err(_) => {
-            return warp::reply::with_status(
-                "Failed to load signing key".to_string(),
+        Err(err) => {
+            return text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                format_error("failed to load signing key", err),
             );
         }
     };
 
+    // Set JWT metadata, including the key id from the database row.
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(signing_key.kid.to_string());
 
+    // Convert stored PEM bytes into an encoding key for signing.
     let key_text = match String::from_utf8(signing_key.key_pem) {
         Ok(text) => text,
-        Err(_) => {
-            return warp::reply::with_status(
-                "Stored signing key was not valid UTF-8".to_string(),
+        Err(err) => {
+            return text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                format_error("stored signing key was not valid UTF-8", err),
             );
         }
     };
 
     let encoding_key = match EncodingKey::from_rsa_pem(key_text.as_bytes()) {
         Ok(key) => key,
-        Err(_) => {
-            return warp::reply::with_status(
-                "Stored signing key was invalid".to_string(),
+        Err(err) => {
+            return text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                format_error("stored signing key was invalid", err),
             );
         }
     };
 
+    // Build the mock claims expected by the project client.
     let claims = JwtClaims {
-        sub: "userABC",
-        name: "userABC",
+        sub: JWT_SUBJECT,
+        name: JWT_NAME,
         iat: now,
         exp: if use_expired_key {
-            now - 3600
+            now - KEY_LIFETIME_SECONDS
         } else {
-            now + 3600
+            now + KEY_LIFETIME_SECONDS
         },
     };
 
     match jwt_encode(&header, &claims, &encoding_key) {
-        Ok(token) => warp::reply::with_status(token, StatusCode::OK),
-        Err(_) => warp::reply::with_status(
-            "Failed to sign JWT".to_string(),
+        Ok(token) => text_response(StatusCode::OK, token),
+        Err(err) => text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            format_error("failed to sign JWT", err),
         ),
     }
 }
 
-fn jwks_handler(state: AppState) -> impl Reply {
+fn jwks_handler(state: AppState) -> warp::reply::WithStatus<warp::reply::Json> {
+    // Load all non-expired keys and convert each to a public JWK entry.
     let private_keys = match load_valid_private_keys(state.db_path()) {
         Ok(keys) => keys,
-        Err(_) => {
-            let body = json!({ "error": "Failed to load keys" });
-            return warp::reply::with_status(
-                warp::reply::json(&body),
+        Err(err) => {
+            return json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                format_error("failed to load keys", err),
             );
         }
     };
 
     let mut keys = Vec::new();
+    let mut malformed_key_count = 0;
 
     for private_key in private_keys {
+        // Skip malformed rows so one bad key does not break the full JWKS response.
         let key_text = match String::from_utf8(private_key.key_pem) {
             Ok(text) => text,
-            Err(_) => continue,
+            Err(_) => {
+                malformed_key_count += 1;
+                continue;
+            }
         };
 
         let parsed_private = match RsaPrivateKey::from_pkcs1_pem(&key_text) {
             Ok(key) => key,
-            Err(_) => continue,
+            Err(_) => {
+                malformed_key_count += 1;
+                continue;
+            }
         };
 
         let public_key = RsaPublicKey::from(&parsed_private);
@@ -274,138 +345,13 @@ fn jwks_handler(state: AppState) -> impl Reply {
         }));
     }
 
+    if keys.is_empty() && malformed_key_count > 0 {
+        return json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to convert valid keys to JWKS",
+        );
+    }
+
     let jwks = json!({ "keys": keys });
     warp::reply::with_status(warp::reply::json(&jwks), StatusCode::OK)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::Connection;
-    use tempfile::TempDir;
-    use warp::test::request;
-
-    fn setup_state() -> (AppState, TempDir) {
-        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let db_path = temp_dir.path().join("test_private_keys.db");
-        initialize_database(db_path.to_str().expect("invalid db path")).expect("failed to init db");
-        (
-            AppState::new(db_path.to_string_lossy().to_string()),
-            temp_dir,
-        )
-    }
-
-    fn load_key_ids(db_path: &str, expired: bool) -> Vec<i64> {
-        let conn = Connection::open(db_path).expect("failed to open db");
-        let now = Utc::now().timestamp();
-        let query = if expired {
-            "SELECT kid FROM keys WHERE exp <= ?1"
-        } else {
-            "SELECT kid FROM keys WHERE exp > ?1"
-        };
-
-        let mut statement = conn.prepare(query).expect("failed to prepare query");
-        let rows = statement
-            .query_map([now], |row| row.get::<_, i64>(0))
-            .expect("failed to run query");
-
-        rows.map(|row| row.expect("invalid row")).collect()
-    }
-
-    fn token_kid(token: &str) -> String {
-        let parts: Vec<&str> = token.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        let decoded = base64_url::decode(parts[0]).expect("invalid JWT header encoding");
-        let json_value: serde_json::Value =
-            serde_json::from_slice(&decoded).expect("invalid JWT header json");
-        json_value["kid"].as_str().expect("missing kid").to_string()
-    }
-
-    #[test]
-    fn database_stores_expired_and_valid_keys() {
-        let (state, _temp_dir) = setup_state();
-        let valid_keys = load_key_ids(state.db_path(), false);
-        let expired_keys = load_key_ids(state.db_path(), true);
-
-        assert!(!valid_keys.is_empty());
-        assert!(!expired_keys.is_empty());
-    }
-
-    #[tokio::test]
-    async fn post_auth_returns_valid_jwt() {
-        let (state, _temp_dir) = setup_state();
-        let routes = build_routes(state.clone());
-
-        let response = request().method("POST").path("/auth").reply(&routes).await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-        let kid = token_kid(token);
-        let valid_ids = load_key_ids(state.db_path(), false);
-        assert!(valid_ids.contains(&kid.parse::<i64>().expect("kid was not numeric")));
-    }
-
-    #[tokio::test]
-    async fn post_auth_expired_uses_expired_key() {
-        let (state, _temp_dir) = setup_state();
-        let routes = build_routes(state.clone());
-
-        let response = request()
-            .method("POST")
-            .path("/auth?expired=1")
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-        let kid = token_kid(token);
-        let expired_ids = load_key_ids(state.db_path(), true);
-        assert!(expired_ids.contains(&kid.parse::<i64>().expect("kid was not numeric")));
-    }
-
-    #[tokio::test]
-    async fn get_jwks_returns_only_valid_keys() {
-        let (state, _temp_dir) = setup_state();
-        let routes = build_routes(state.clone());
-
-        let response = request()
-            .method("GET")
-            .path("/.well-known/jwks.json")
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let parsed: serde_json::Value =
-            serde_json::from_slice(response.body()).expect("invalid json response");
-        let keys = parsed["keys"].as_array().expect("keys was not an array");
-
-        let valid_ids = load_key_ids(state.db_path(), false)
-            .into_iter()
-            .map(|kid| kid.to_string())
-            .collect::<Vec<_>>();
-
-        let expired_ids = load_key_ids(state.db_path(), true)
-            .into_iter()
-            .map(|kid| kid.to_string())
-            .collect::<Vec<_>>();
-
-        assert!(!keys.is_empty());
-
-        for key in keys {
-            let kid = key["kid"].as_str().expect("kid missing from jwks key");
-            assert!(valid_ids.contains(&kid.to_string()));
-            assert!(!expired_ids.contains(&kid.to_string()));
-        }
-    }
-
-    #[tokio::test]
-    async fn method_not_allowed_is_enforced() {
-        let (state, _temp_dir) = setup_state();
-        let routes = build_routes(state);
-
-        let response = request().method("GET").path("/auth").reply(&routes).await;
-
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    }
 }
