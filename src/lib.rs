@@ -59,8 +59,15 @@ fn format_error(context: &str, err: impl std::fmt::Display) -> String {
     format!("{context}: {err}")
 }
 
+fn with_context<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => Err(format_error(context, err.to_string())),
+    }
+}
+
 fn open_connection(db_path: &str) -> Result<Connection, String> {
-    Connection::open(db_path).map_err(|err| format_error("failed to open SQLite database", err))
+    with_context(Connection::open(db_path), "failed to open SQLite database")
 }
 
 /// Creates/opens the SQLite database, ensures schema exists, and seeds keys.
@@ -68,8 +75,7 @@ pub fn initialize_database(db_path: &str) -> Result<(), String> {
     // Open/create the database, ensure schema exists, and seed required key rows.
     let mut conn = open_connection(db_path)?;
 
-    conn.execute(TABLE_SCHEMA, [])
-        .map_err(|err| format_error("failed to create keys table", err))?;
+    with_context(conn.execute(TABLE_SCHEMA, []), "failed to create keys table")?;
 
     ensure_seed_keys(&mut conn)?;
     Ok(())
@@ -77,60 +83,61 @@ pub fn initialize_database(db_path: &str) -> Result<(), String> {
 
 fn ensure_seed_keys(conn: &mut Connection) -> Result<(), String> {
     let now = Utc::now().timestamp();
-    let transaction = conn
-        .transaction()
-        .map_err(|err| format_error("failed to start seed transaction", err))?;
+    let transaction = with_context(conn.transaction(), "failed to start seed transaction")?;
 
     // Seed one expired key if none currently exist.
-    let expired_count: i64 = transaction
+    let expired_count = transaction
         .query_row("SELECT COUNT(1) FROM keys WHERE exp <= ?1", [now], |row| {
             row.get(0)
-        })
-        .map_err(|err| format_error("failed to count expired keys", err))?;
+        });
+    let expired_count: i64 = with_context(expired_count, "failed to count expired keys")?;
 
     if expired_count == 0 {
         let expired_pem = generate_private_key_pem()?;
         let expired_exp = now - KEY_LIFETIME_SECONDS;
-        transaction
-            .execute(
+        with_context(
+            transaction.execute(
                 "INSERT INTO keys (key, exp) VALUES (?, ?)",
                 params![expired_pem.into_bytes(), expired_exp],
-            )
-            .map_err(|err| format_error("failed to insert expired key", err))?;
+            ),
+            "failed to insert expired key",
+        )?;
     }
 
     // Seed one valid key if none currently exist.
-    let valid_count: i64 = transaction
+    let valid_count = transaction
         .query_row("SELECT COUNT(1) FROM keys WHERE exp > ?1", [now], |row| {
             row.get(0)
-        })
-        .map_err(|err| format_error("failed to count valid keys", err))?;
+        });
+    let valid_count: i64 = with_context(valid_count, "failed to count valid keys")?;
 
     if valid_count == 0 {
         let valid_pem = generate_private_key_pem()?;
         let valid_exp = now + KEY_LIFETIME_SECONDS;
-        transaction
-            .execute(
+        with_context(
+            transaction.execute(
                 "INSERT INTO keys (key, exp) VALUES (?, ?)",
                 params![valid_pem.into_bytes(), valid_exp],
-            )
-            .map_err(|err| format_error("failed to insert valid key", err))?;
+            ),
+            "failed to insert valid key",
+        )?;
     }
 
-    transaction
-        .commit()
-        .map_err(|err| format_error("failed to commit seed transaction", err))?;
+    with_context(transaction.commit(), "failed to commit seed transaction")?;
 
     Ok(())
 }
 
 fn generate_private_key_pem() -> Result<String, String> {
-    let private_key = RsaPrivateKey::new(&mut thread_rng(), 2048)
-        .map_err(|err| format_error("failed to generate RSA private key", err))?;
-    private_key
-        .to_pkcs1_pem(LineEnding::LF)
-        .map(|pem| pem.to_string())
-        .map_err(|err| format_error("failed to encode private key as PKCS1 PEM", err))
+    let private_key = with_context(
+        RsaPrivateKey::new(&mut thread_rng(), 2048),
+        "failed to generate RSA private key",
+    )?;
+    let pem = with_context(
+        private_key.to_pkcs1_pem(LineEnding::LF),
+        "failed to encode private key as PKCS1 PEM",
+    )?;
+    Ok(pem.to_string())
 }
 
 fn load_signing_key(db_path: &str, use_expired: bool) -> Result<StoredKey, String> {
@@ -144,13 +151,13 @@ fn load_signing_key(db_path: &str, use_expired: bool) -> Result<StoredKey, Strin
         "SELECT kid, key FROM keys WHERE exp > ?1 ORDER BY exp ASC LIMIT 1"
     };
 
-    conn.query_row(query, [now], |row| {
+    let signing_key = conn.query_row(query, [now], |row| {
         Ok(StoredKey {
             kid: row.get(0)?,
             key_pem: row.get(1)?,
         })
-    })
-    .map_err(|err| format_error("failed to load signing key", err))
+    });
+    with_context(signing_key, "failed to load signing key")
 }
 
 fn load_valid_private_keys(db_path: &str) -> Result<Vec<StoredKey>, String> {
@@ -158,9 +165,10 @@ fn load_valid_private_keys(db_path: &str) -> Result<Vec<StoredKey>, String> {
     let conn = open_connection(db_path)?;
     let now = Utc::now().timestamp();
 
-    let mut statement = conn
-        .prepare("SELECT kid, key FROM keys WHERE exp > ?1 ORDER BY kid ASC")
-        .map_err(|err| format_error("failed to prepare valid-key query", err))?;
+    let mut statement = with_context(
+        conn.prepare("SELECT kid, key FROM keys WHERE exp > ?1 ORDER BY kid ASC"),
+        "failed to prepare valid-key query",
+    )?;
 
     let rows = statement
         .query_map([now], |row| {
@@ -168,12 +176,12 @@ fn load_valid_private_keys(db_path: &str) -> Result<Vec<StoredKey>, String> {
                 kid: row.get(0)?,
                 key_pem: row.get(1)?,
             })
-        })
-        .map_err(|err| format_error("failed to execute valid-key query", err))?;
+        });
+    let rows = with_context(rows, "failed to execute valid-key query")?;
 
     let mut keys = Vec::new();
     for row in rows {
-        keys.push(row.map_err(|err| format_error("failed to read key row", err))?);
+        keys.push(with_context(row, "failed to read key row")?);
     }
 
     Ok(keys)
@@ -354,4 +362,104 @@ fn jwks_handler(state: AppState) -> warp::reply::WithStatus<warp::reply::Json> {
 
     let jwks = json!({ "keys": keys });
     warp::reply::with_status(warp::reply::json(&jwks), StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+    use tempfile::TempDir;
+    use warp::test::request;
+
+    fn setup_state() -> (AppState, TempDir) {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("lib_unit_test.db");
+        let db_path_str = db_path.to_str().expect("invalid db path");
+
+        initialize_database(db_path_str).expect("failed to initialize db");
+        (AppState::new(db_path_str.to_string()), temp_dir)
+    }
+
+    #[test]
+    fn initialize_database_is_idempotent() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("idempotent_seed.db");
+        let db_path_str = db_path.to_str().expect("invalid db path");
+
+        initialize_database(db_path_str).expect("first initialization failed");
+        initialize_database(db_path_str).expect("second initialization failed");
+
+        let conn = Connection::open(db_path_str).expect("failed to open db");
+        let total_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM keys", [], |row| row.get(0))
+            .expect("failed to query total key count");
+        let now = Utc::now().timestamp();
+        let expired_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM keys WHERE exp <= ?1", [now], |row| {
+                row.get(0)
+            })
+            .expect("failed to query expired key count");
+        let valid_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM keys WHERE exp > ?1", [now], |row| {
+                row.get(0)
+            })
+            .expect("failed to query valid key count");
+
+        assert_eq!(total_count, 2, "database should keep exactly two seed keys");
+        assert_eq!(expired_count, 1, "expected exactly one expired key");
+        assert_eq!(valid_count, 1, "expected exactly one valid key");
+    }
+
+    #[tokio::test]
+    async fn auth_and_jwks_return_ok_for_seeded_database() {
+        let (state, _temp_dir) = setup_state();
+        let routes = build_routes(state);
+
+        let auth_response = request().method("POST").path("/auth").reply(&routes).await;
+        assert_eq!(auth_response.status(), StatusCode::OK);
+
+        let jwks_response = request()
+            .method("GET")
+            .path("/.well-known/jwks.json")
+            .reply(&routes)
+            .await;
+        assert_eq!(jwks_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_returns_500_for_missing_database_path() {
+        let routes = build_routes(AppState::new("this/path/does/not/exist/lib_auth_missing.db"));
+        let response = request().method("POST").path("/auth").reply(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn jwks_returns_500_for_missing_database_path() {
+        let routes = build_routes(AppState::new("this/path/does/not/exist/lib_jwks_missing.db"));
+        let response = request()
+            .method("GET")
+            .path("/.well-known/jwks.json")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn auth_returns_500_for_invalid_utf8_signing_key() {
+        let (state, _temp_dir) = setup_state();
+        let conn = Connection::open(state.db_path()).expect("failed to open db");
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "UPDATE keys SET key = ?1 WHERE exp > ?2",
+            params![vec![0xff_u8, 0xfe_u8, 0xfd_u8], now],
+        )
+        .expect("failed to update valid key blob");
+
+        let routes = build_routes(state);
+        let response = request().method("POST").path("/auth").reply(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
